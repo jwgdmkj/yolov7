@@ -505,12 +505,15 @@ class IBin(nn.Module):
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
 
+# Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors = hyp.get('anchors')).to(device)
 class Model(nn.Module):
     def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
         super(Model, self).__init__()
         self.traced = False
+
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
+
         else:  # is *.yaml
             import yaml  # for torch hub
             self.yaml_file = Path(cfg).name
@@ -525,6 +528,7 @@ class Model(nn.Module):
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
+
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
@@ -579,6 +583,8 @@ class Model(nn.Module):
         logger.info('')
 
     def forward(self, x, augment=False, profile=False):
+
+        # if augmentation is True -------------------------------
         if augment:
             img_size = x.shape[-2:]  # height, width
             s = [1, 0.83, 0.67]  # scales
@@ -595,6 +601,7 @@ class Model(nn.Module):
                     yi[..., 0] = img_size[1] - yi[..., 0]  # de-flip lr
                 y.append(yi)
             return torch.cat(y, 1), None  # augmented inference, train
+        # else -------------------------------
         else:
             return self.forward_once(x, profile)  # single-scale inference, train
 
@@ -740,6 +747,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
@@ -760,6 +768,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                  Ghost, GhostCSPA, GhostCSPB, GhostCSPC,
                  SwinTransformerBlock, STCSPA, STCSPB, STCSPC,
                  SwinTransformer2Block, ST2CSPA, ST2CSPB, ST2CSPC]:
+
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
@@ -777,26 +786,36 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                      ST2CSPA, ST2CSPB, ST2CSPC]:
                 args.insert(2, n)  # number of repeats
                 n = 1
+
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
+
         elif m is Concat:
             c2 = sum([ch[x] for x in f])
+
         elif m is Chuncat:
             c2 = sum([ch[x] for x in f])
+
         elif m is Shortcut:
             c2 = ch[f[0]]
+
         elif m is Foldcut:
             c2 = ch[f] // 2
+
         elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)
+
         elif m is ReOrg:
             c2 = ch[f] * 4
+
         elif m is Contract:
             c2 = ch[f] * args[0] ** 2
+
         elif m is Expand:
             c2 = ch[f] // args[0] ** 2
+
         else:
             c2 = ch[f]
 
