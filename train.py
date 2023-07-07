@@ -1,3 +1,6 @@
+# python3 -m torch.distributed.launch --nproc_per_node 2 --master_port 28888 train.py --workers 16 --device 0,1 --batch-size 4 --epoch 80 --data data/visdrone.yaml --img 640 640 --cfg cfg/training/yolov7x.yaml --weights './weights/yolov7x_training.pt' --name yolov7drone-custom --hyp data/hyp.scratch.custom.yaml
+# python3 train.py --workers 8 --device 0 --batch-size 32 --data data/custom.yaml --img 640 640 --cfg cfg/training/yolov7-custom.yaml --weights 'yolov7_training.pt' --name yolov7-custom --hyp data/hyp.scratch.custom.yaml
+
 import argparse
 import logging
 import math
@@ -37,26 +40,33 @@ from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
 logger = logging.getLogger(__name__)
 
+'''
+baseline : 모델의 기본 구성파일. 표준 아키텍처
+training : 모델을 교육하기 위해 특별히 조정된 구성파일 포함.정화 기법 or dropout 같이, 교육에는 필요하나 deployment엔 필요없는 요소?
+deploy : 모델을 배포하기 위한 구성파일(?) 확인 요망
+
+yolo.py의 parse_model : yaml로부터 모델의 구조를 파싱
+'''
 
 def train(hyp, opt, device, tb_writer=None):
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
     save_dir, epochs, batch_size, total_batch_size, weights, rank, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank, opt.freeze
 
-    # Directories
+    # Directories -------------------------------------------------------------------
     wdir = save_dir / 'weights'
     wdir.mkdir(parents=True, exist_ok=True)  # make dir
     last = wdir / 'last.pt'
     best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
 
-    # Save run settings
+    # Save run settings -------------------------------------------------------------------
     with open(save_dir / 'hyp.yaml', 'w') as f:
         yaml.dump(hyp, f, sort_keys=False)
     with open(save_dir / 'opt.yaml', 'w') as f:
         yaml.dump(vars(opt), f, sort_keys=False)
 
-    # Configure
+    # Configure -------------------------------------------------------------------
     plots = not opt.evolve  # create plots
     cuda = device.type != 'cpu'
     init_seeds(2 + rank)
@@ -79,8 +89,9 @@ def train(hyp, opt, device, tb_writer=None):
     names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
-    # Model
+    # Model -------------------------------------------------------------------
     pretrained = weights.endswith('.pt')
+
     if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
@@ -91,14 +102,17 @@ def train(hyp, opt, device, tb_writer=None):
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
+
+    # create own model
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
+
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
     test_path = data_dict['val']
 
-    # Freeze
+    # Freeze -------------------------------------------------------------------
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # parameter names to freeze (full or partial)
     for k, v in model.named_parameters():
         v.requires_grad = True  # train all layers
@@ -106,7 +120,7 @@ def train(hyp, opt, device, tb_writer=None):
             print('freezing %s' % k)
             v.requires_grad = False
 
-    # Optimizer
+    # Optimizer -------------------------------------------------------------------
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
@@ -196,10 +210,10 @@ def train(hyp, opt, device, tb_writer=None):
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     # plot_lr_scheduler(optimizer, scheduler, epochs)
 
-    # EMA
+    # EMA -------------------------------------------------------------------
     ema = ModelEMA(model) if rank in [-1, 0] else None
 
-    # Resume
+    # Resume -------------------------------------------------------------------
     start_epoch, best_fitness = 0, 0.0
     if pretrained:
         # Optimizer
@@ -227,7 +241,7 @@ def train(hyp, opt, device, tb_writer=None):
 
         del ckpt, state_dict
 
-    # Image sizes
+    # Image sizes -------------------------------------------------------------------
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
@@ -236,12 +250,12 @@ def train(hyp, opt, device, tb_writer=None):
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
-    # SyncBatchNorm
+    # SyncBatchNorm -------------------------------------------------------------------
     if opt.sync_bn and cuda and rank != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         logger.info('Using SyncBatchNorm()')
 
-    # Trainloader
+    # Trainloader -------------------------------------------------------------------
     dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
@@ -250,7 +264,7 @@ def train(hyp, opt, device, tb_writer=None):
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
-    # Process 0
+    # Process 0 -------------------------------------------------------------------
     if rank in [-1, 0]:
         testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
@@ -272,13 +286,13 @@ def train(hyp, opt, device, tb_writer=None):
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
 
-    # DDP mode
+    # DDP mode -------------------------------------------------------------------
     if cuda and rank != -1:
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank,
                     # nn.MultiheadAttention incompatibility with DDP https://github.com/pytorch/pytorch/issues/26698
                     find_unused_parameters=any(isinstance(layer, nn.MultiheadAttention) for layer in model.modules()))
 
-    # Model parameters
+    # Model parameters -------------------------------------------------------------------
     hyp['box'] *= 3. / nl  # scale to layers
     hyp['cls'] *= nc / 80. * 3. / nl  # scale to classes and layers
     hyp['obj'] *= (imgsz / 640) ** 2 * 3. / nl  # scale to image size and layers
@@ -289,7 +303,7 @@ def train(hyp, opt, device, tb_writer=None):
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
-    # Start training
+    # Start training -------------------------------------------------------------------
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
@@ -304,7 +318,9 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
-    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+
+    # epoch ------------------------------------------------------------------
+    for epoch in range(start_epoch, epochs):
         model.train()
 
         # Update image weights (optional)
@@ -477,9 +493,9 @@ def train(hyp, opt, device, tb_writer=None):
                         wandb_logger.log_model(
                             last.parent, opt, epoch, fi, best_model=best_fitness == fi)
                 del ckpt
-
         # end epoch ----------------------------------------------------------------------------------------------------
-    # end training
+    # end training -------------------------------------------------------------------
+
     if rank in [-1, 0]:
         # Plots
         if plots:
@@ -528,20 +544,24 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='yolo7.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--data', type=str, default='data/coco.yaml', help='data.yaml path')
+    parser.add_argument('--data', type=str, default='data/visdrone.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.p5.yaml', help='hyperparameters path')
+
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='[train, test] image sizes')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
+
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
     parser.add_argument('--noautoanchor', action='store_true', help='disable autoanchor check')
+
     parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')
     parser.add_argument('--bucket', type=str, default='', help='gsutil bucket')
     parser.add_argument('--cache-images', action='store_true', help='cache images for faster training')
     parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
+
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--multi-scale', action='store_true', help='vary img-size +/- 50%%')
     parser.add_argument('--single-cls', action='store_true', help='train multi-class data as single-class')
@@ -549,15 +569,18 @@ if __name__ == '__main__':
     parser.add_argument('--sync-bn', action='store_true', help='use SyncBatchNorm, only available in DDP mode')
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter, do not modify')
     parser.add_argument('--workers', type=int, default=8, help='maximum number of dataloader workers')
+
     parser.add_argument('--project', default='runs/train', help='save to project/name')
     parser.add_argument('--entity', default=None, help='W&B entity')
     parser.add_argument('--name', default='exp', help='save to project/name')
+
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
     parser.add_argument('--label-smoothing', type=float, default=0.0, help='Label smoothing epsilon')
     parser.add_argument('--upload_dataset', action='store_true', help='Upload dataset as W&B artifact table')
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
+
     parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
@@ -568,6 +591,7 @@ if __name__ == '__main__':
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
+
     #if opt.global_rank in [-1, 0]:
     #    check_git_status()
     #    check_requirements()
@@ -605,7 +629,7 @@ if __name__ == '__main__':
     with open(opt.hyp) as f:
         hyp = yaml.load(f, Loader=yaml.SafeLoader)  # load hyps
 
-    # Train
+    # Train (not evolve hyp) -------------------------------------------------------------------
     logger.info(opt)
     if not opt.evolve:
         tb_writer = None  # init loggers
@@ -614,8 +638,9 @@ if __name__ == '__main__':
             logger.info(f"{prefix}Start with 'tensorboard --logdir {opt.project}', view at http://localhost:6006/")
             tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
         train(hyp, opt, device, tb_writer)
+    # Train over (not evolve hyp) -------------------------------------------------------------------
 
-    # Evolve hyperparameters (optional)
+    # Train (Evolve hyperparameters, optional) -------------------------------------------------------------------
     else:
         # Hyperparameter evolution metadata (mutation scale 0-1, lower_limit, upper_limit)
         meta = {'lr0': (1, 1e-5, 1e-1),  # initial learning rate (SGD=1E-2, Adam=1E-3)
@@ -661,7 +686,8 @@ if __name__ == '__main__':
         if opt.bucket:
             os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # download evolve.txt if exists
 
-        for _ in range(300):  # generations to evolve
+        # generations to evolve -------------------------------------------------------------------
+        for _ in range(300):
             if Path('evolve.txt').exists():  # if evolve.txt exists: select best hyps and mutate
                 # Select parent(s)
                 parent = 'single'  # parent selection method: 'single' or 'weighted'
@@ -687,19 +713,20 @@ if __name__ == '__main__':
                 for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
                     hyp[k] = float(x[i + 7] * v[i])  # mutate
 
-            # Constrain to limits
+            # Constrain to limits -------------------------------------------------------------------
             for k, v in meta.items():
                 hyp[k] = max(hyp[k], v[1])  # lower limit
                 hyp[k] = min(hyp[k], v[2])  # upper limit
                 hyp[k] = round(hyp[k], 5)  # significant digits
 
-            # Train mutation
+            # Train mutation -------------------------------------------------------------------
             results = train(hyp.copy(), opt, device)
 
-            # Write mutation results
+            # Write mutation results -------------------------------------------------------------------
             print_mutation(hyp.copy(), results, yaml_file, opt.bucket)
 
         # Plot results
         plot_evolution(yaml_file)
         print(f'Hyperparameter evolution complete. Best results saved as: {yaml_file}\n'
               f'Command to train a new model with these hyperparameters: $ python train.py --hyp {yaml_file}')
+    # Train over (Evolve hyperparameters, optional) -------------------------------------------------------------------
